@@ -1,0 +1,797 @@
+from __future__ import annotations
+
+import json
+import os
+import queue
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import webbrowser
+from datetime import datetime
+from pathlib import Path
+from tkinter import filedialog, messagebox
+from urllib.parse import urlparse
+
+try:
+    import tkinter as tk
+    import customtkinter as ctk
+except ImportError:
+    from bootstrap import ensure_dependencies
+    ensure_dependencies()
+    import tkinter as tk
+    import customtkinter as ctk
+
+APP_NAME = "HiBinds"
+DB_NAME = "HIBinds.json"
+SETTINGS_NAME = "settings.json"
+EXPORT_VERSION = 1
+
+ACCENT = "#6C63FF"
+ACCENT_HOVER = "#8179FF"
+SUCCESS = "#2FBF71"
+WARNING = "#F2A93B"
+DANGER = "#EF5B6B"
+BG_DARK = "#0D1018"
+CARD_DARK = "#151A26"
+CARD_DARK_2 = "#1B2130"
+TEXT_DARK = "#F4F6FA"
+MUTED_DARK = "#9AA4B5"
+BG_LIGHT = "#F4F6FB"
+CARD_LIGHT = "#FFFFFF"
+TEXT_LIGHT = "#171B26"
+MUTED_LIGHT = "#6B7280"
+
+
+def app_data_dir() -> Path:
+    base = os.getenv("APPDATA")
+    path = (Path(base) / APP_NAME) if base else (Path.home() / f".{APP_NAME.lower()}")
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+DATA_DIR = app_data_dir()
+DB_FILE = DATA_DIR / DB_NAME
+SETTINGS_FILE = DATA_DIR / SETTINGS_NAME
+
+
+def load_settings() -> dict:
+    defaults = {"appearance": "Dark", "autostart": False}
+    try:
+        data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8")) if SETTINGS_FILE.exists() else {}
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    result = {**defaults, **data}
+    return result
+
+
+def save_settings(data: dict) -> None:
+    tmp = SETTINGS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(SETTINGS_FILE)
+
+
+def legacy_candidates() -> list[Path]:
+    candidates = []
+    locations = [DATA_DIR, Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path.cwd()]
+    for base in locations:
+        for name in ("HIBinds.json", "HIbinds.json"):
+            p = base / name
+            if p not in candidates:
+                candidates.append(p)
+    return candidates
+
+
+def ensure_db() -> None:
+    if DB_FILE.exists():
+        return
+    for legacy in legacy_candidates():
+        if legacy.exists():
+            try:
+                data = json.loads(legacy.read_text(encoding="utf-8") or "{}")
+                if isinstance(data, dict):
+                    DB_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+                    return
+            except Exception:
+                pass
+    DB_FILE.write_text("{}", encoding="utf-8")
+
+
+def load_binds() -> dict:
+    ensure_db()
+    try:
+        data = json.loads(DB_FILE.read_text(encoding="utf-8") or "{}")
+        if not isinstance(data, dict):
+            raise ValueError("Корень базы должен быть объектом.")
+        return data
+    except (json.JSONDecodeError, OSError, ValueError):
+        backup = DB_FILE.with_name(f"HIBinds.broken_{int(time.time())}.json")
+        try:
+            shutil.copy2(DB_FILE, backup)
+        except OSError:
+            pass
+        DB_FILE.write_text("{}", encoding="utf-8")
+        return {}
+
+
+def save_binds(data: dict) -> None:
+    tmp = DB_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(DB_FILE)
+
+
+def normalize_target(value: str) -> str:
+    value = value.strip().strip('"').strip("'")
+    if value.lower().startswith("file:///"):
+        value = value[8:]
+    return os.path.expandvars(os.path.expanduser(value))
+
+
+def is_url(value: str) -> bool:
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def valid_hotkey(value: str) -> bool:
+    if not value:
+        return True
+    parts = [x.strip() for x in re.split(r"\+", value) if x.strip()]
+    if not parts:
+        return False
+    modifiers = {"CTRL", "ALT", "SHIFT", "WIN", "CMD"}
+    base = parts[-1].upper()
+    if any(p.upper() not in modifiers for p in parts[:-1]):
+        return False
+    if base in modifiers:
+        return False
+    valid_base = bool(re.fullmatch(r"F(?:[1-9]|1[0-9]|2[0-4])", base)) or bool(re.fullmatch(r"[A-Z0-9]", base))
+    valid_base = valid_base or base in {"ENTER", "ESC", "TAB", "SPACE", "BACKSPACE", "DELETE", "HOME", "END", "UP", "DOWN", "LEFT", "RIGHT", "INSERT", "PAGEUP", "PAGEDOWN"}
+    return valid_base
+
+
+def validate_binds(data: dict) -> tuple[int, list[dict]]:
+    issues: list[dict] = []
+    if not isinstance(data, dict):
+        return 0, [{"level": "error", "bind": "База", "message": "Корень базы должен быть объектом."}]
+
+    hotkeys: dict[str, str] = {}
+    working = 0
+    for name, info in data.items():
+        bind_ok = True
+        if not isinstance(name, str) or not name.strip():
+            issues.append({"level": "error", "bind": str(name), "message": "Пустое или некорректное название."})
+            bind_ok = False
+        if not isinstance(info, dict):
+            issues.append({"level": "error", "bind": str(name), "message": "Данные бинда повреждены."})
+            continue
+
+        hotkey = str(info.get("hotkey", "")).strip()
+        if hotkey:
+            if not valid_hotkey(hotkey):
+                issues.append({"level": "warning", "bind": name, "message": f"Некорректная горячая клавиша: {hotkey}"})
+                bind_ok = False
+            key = hotkey.upper().replace(" ", "")
+            if key in hotkeys:
+                issues.append({"level": "warning", "bind": name, "message": f"Дубликат горячей клавиши с «{hotkeys[key]}»."})
+                bind_ok = False
+            else:
+                hotkeys[key] = name
+
+        actions = info.get("actions")
+        if not isinstance(actions, list) or not actions:
+            issues.append({"level": "error", "bind": name, "message": "Нет действий."})
+            continue
+
+        seen_targets: set[tuple[str, str]] = set()
+        for index, action in enumerate(actions, 1):
+            if not isinstance(action, dict):
+                issues.append({"level": "error", "bind": name, "message": f"Шаг {index}: повреждён."})
+                bind_ok = False
+                continue
+            action_type = action.get("type")
+            target = normalize_target(str(action.get("action", "")))
+            delay = action.get("delay_ms", 0)
+            try:
+                delay_value = int(delay)
+                if delay_value < 0 or delay_value > 86_400_000:
+                    raise ValueError
+            except (TypeError, ValueError):
+                issues.append({"level": "error", "bind": name, "message": f"Шаг {index}: некорректная задержка."})
+                bind_ok = False
+                delay_value = 0
+
+            key = (str(action_type), target.lower())
+            if key in seen_targets:
+                issues.append({"level": "warning", "bind": name, "message": f"Шаг {index}: дублирующееся действие."})
+                bind_ok = False
+            seen_targets.add(key)
+
+            if action_type == "url":
+                if not is_url(target):
+                    issues.append({"level": "error", "bind": name, "message": f"Шаг {index}: URL некорректен."})
+                    bind_ok = False
+            elif action_type == "app":
+                if not os.path.isfile(target):
+                    issues.append({"level": "warning", "bind": name, "message": f"Шаг {index}: файл не найден."})
+                    bind_ok = False
+            else:
+                issues.append({"level": "error", "bind": name, "message": f"Шаг {index}: неизвестный тип действия."})
+                bind_ok = False
+            _ = delay_value
+
+        if bind_ok:
+            working += 1
+    return working, issues
+
+
+def set_windows_autostart(enabled: bool) -> tuple[bool, str]:
+    if os.name != "nt":
+        return False, "Автозапуск Windows доступен только на Windows."
+    try:
+        import winreg
+
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE) as key:
+            value = str(Path(sys.executable).resolve()) if getattr(sys, "frozen", False) else f'"{sys.executable}" "{Path(__file__).resolve()}"'
+            if enabled:
+                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, value)
+            else:
+                try:
+                    winreg.DeleteValue(key, APP_NAME)
+                except FileNotFoundError:
+                    pass
+        return True, ""
+    except OSError as exc:
+        return False, str(exc)
+
+
+class HiBindsApp(ctk.CTk):
+    def __init__(self):
+        self.settings = load_settings()
+        ctk.set_appearance_mode(self.settings.get("appearance", "Dark"))
+        ctk.set_default_color_theme("blue")
+        super().__init__()
+
+        self.title("HiBinds — Command Center")
+        self.geometry("1180x760")
+        self.minsize(980, 680)
+        self.configure(fg_color=(BG_LIGHT, BG_DARK))
+
+        self.binds = load_binds()
+        self.new_actions: list[dict] = []
+        self.log_queue: queue.Queue[str] = queue.Queue()
+        self.running = False
+        self.stop_event = threading.Event()
+        self.current_view = "dashboard"
+        self.validation = validate_binds(self.binds)
+
+        self._build_shell()
+        self.show_dashboard()
+        self.after(100, self._drain_logs)
+        self.after(250, self._animate_glow)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ---------- UI shell ----------
+    def _build_shell(self):
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        self.sidebar = ctk.CTkFrame(self, width=220, corner_radius=22, fg_color=("#E9ECF4", "#111621"))
+        self.sidebar.grid(row=0, column=0, padx=(16, 8), pady=16, sticky="nsew")
+        self.sidebar.grid_rowconfigure(9, weight=1)
+
+        brand = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        brand.grid(row=0, column=0, padx=18, pady=(18, 8), sticky="ew")
+        ctk.CTkLabel(brand, text="HiBinds", font=ctk.CTkFont(size=28, weight="bold"), text_color=(TEXT_LIGHT, TEXT_DARK)).pack(anchor="w")
+        ctk.CTkLabel(brand, text="Command Center", font=ctk.CTkFont(size=12), text_color=(MUTED_LIGHT, MUTED_DARK)).pack(anchor="w", pady=(1, 0))
+
+        self.nav_dashboard = self._nav_button("⌂  Обзор", 1, self.show_dashboard)
+        self.nav_binds = self._nav_button("⚡  Мои бинды", 2, self.show_run_view)
+        self.nav_create = self._nav_button("＋  Создать", 3, self.show_create_view)
+        self.nav_settings = self._nav_button("⚙  Настройки", 4, self.show_settings)
+
+        tools = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        tools.grid(row=6, column=0, padx=14, pady=(22, 4), sticky="ew")
+        ctk.CTkLabel(tools, text="ИНСТРУМЕНТЫ", font=ctk.CTkFont(size=10, weight="bold"), text_color=(MUTED_LIGHT, MUTED_DARK)).pack(anchor="w", padx=6, pady=(0, 6))
+        ctk.CTkButton(tools, text="↥  Экспорт .hibinds", height=36, corner_radius=12, fg_color=("#DDE2F0", "#202737"), hover_color=("#CFD5E5", "#293246"), text_color=(TEXT_LIGHT, TEXT_DARK), command=self.export_binds).pack(fill="x", pady=3)
+        ctk.CTkButton(tools, text="↧  Импорт .hibinds", height=36, corner_radius=12, fg_color=("#DDE2F0", "#202737"), hover_color=("#CFD5E5", "#293246"), text_color=(TEXT_LIGHT, TEXT_DARK), command=self.import_binds).pack(fill="x", pady=3)
+        ctk.CTkButton(tools, text="✓  Проверить всё", height=36, corner_radius=12, fg_color=("#DDE2F0", "#202737"), hover_color=("#CFD5E5", "#293246"), text_color=(TEXT_LIGHT, TEXT_DARK), command=self.run_validation).pack(fill="x", pady=3)
+
+        self.sidebar_status = ctk.CTkLabel(self.sidebar, text="●  Система готова", anchor="w", font=ctk.CTkFont(size=12, weight="bold"), text_color=("#168B4C", "#59D68E"))
+        self.sidebar_status.grid(row=10, column=0, padx=20, pady=(8, 12), sticky="w")
+        ctk.CTkLabel(self.sidebar, text="Данные сохраняются автоматически\n%APPDATA%\\HiBinds", justify="left", text_color=(MUTED_LIGHT, MUTED_DARK), font=ctk.CTkFont(size=10)).grid(row=11, column=0, padx=20, pady=(0, 18), sticky="w")
+
+        self.main = ctk.CTkFrame(self, corner_radius=22, fg_color=("#EEF1F7", "#0F141E"))
+        self.main.grid(row=0, column=1, padx=(8, 16), pady=16, sticky="nsew")
+        self.main.grid_columnconfigure(0, weight=1)
+        self.main.grid_rowconfigure(1, weight=1)
+
+    def _nav_button(self, text: str, row: int, command):
+        btn = ctk.CTkButton(self.sidebar, text=text, height=42, corner_radius=12, anchor="w", fg_color="transparent", hover_color=("#DDE2F0", "#202838"), text_color=(TEXT_LIGHT, TEXT_DARK), command=command)
+        btn.grid(row=row, column=0, padx=14, pady=3, sticky="ew")
+        return btn
+
+    def _hero(self, title: str, subtitle: str):
+        hero = ctk.CTkFrame(self.main, height=138, corner_radius=20, fg_color=("#E8E9FF", "#191B33"))
+        hero.grid(row=0, column=0, padx=18, pady=18, sticky="ew")
+        hero.grid_columnconfigure(0, weight=1)
+
+        canvas = tk.Canvas(hero, height=136, highlightthickness=0, bd=0, bg="#191B33")
+        canvas.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self._hero_canvas = canvas
+        self._glow_phase = 0.0
+        canvas.create_oval(-80, 5, 170, 255, fill="#252854", outline="")
+        canvas.create_oval(620, -110, 920, 190, fill="#202443", outline="")
+        canvas.create_oval(760, 30, 980, 250, fill="#1E2943", outline="")
+
+        content = ctk.CTkFrame(hero, fg_color="transparent")
+        content.place(relx=0.035, rely=0.15, relwidth=0.93, relheight=0.75)
+        ctk.CTkLabel(content, text=title, font=ctk.CTkFont(size=31, weight="bold"), text_color="#FFFFFF").pack(anchor="w")
+        ctk.CTkLabel(content, text=subtitle, font=ctk.CTkFont(size=13), text_color="#C8CDE8", wraplength=720, justify="left").pack(anchor="w", pady=(5, 12))
+        return hero
+
+    def _animate_glow(self):
+        if hasattr(self, "_hero_canvas") and self._hero_canvas.winfo_exists():
+            self._glow_phase += 0.045
+            shift = int(26 * (1 + __import__('math').sin(self._glow_phase)))
+            # Subtle motion by moving the right-side highlight.
+            try:
+                self._hero_canvas.coords(2, 620 + shift, -110, 920 + shift, 190)
+            except tk.TclError:
+                pass
+        self.after(250, self._animate_glow)
+
+    def clear_main(self):
+        for child in self.main.winfo_children():
+            child.destroy()
+        self._hero_canvas = None
+
+    # ---------- dashboard ----------
+    def show_dashboard(self):
+        self.current_view = "dashboard"
+        self.clear_main()
+        self.validation = validate_binds(self.binds)
+        working, issues = self.validation
+        self._hero("Управляй биндами спокойно", "Импортируй, экспортируй и проверяй конфигурацию в один клик. Интерфейс следит за файлами и предупреждает о проблемах ещё до запуска.")
+
+        body = ctk.CTkFrame(self.main, fg_color="transparent")
+        body.grid(row=1, column=0, padx=18, pady=(0, 18), sticky="nsew")
+        body.grid_columnconfigure((0, 1, 2), weight=1)
+        body.grid_rowconfigure(1, weight=1)
+
+        self._stat_card(body, 0, "⚡", "Всего биндов", str(len(self.binds)), "Конфигурация загружена")
+        self._stat_card(body, 1, "✓", "Работают", str(working), "Проверка прошла")
+        self._stat_card(body, 2, "⚠", "Требуют внимания", str(len(issues)), "Нажми «Проверить всё»")
+
+        check_card = ctk.CTkFrame(body, corner_radius=18, fg_color=(CARD_LIGHT, CARD_DARK), border_width=1, border_color=("#DDE2EC", "#252C3B"))
+        check_card.grid(row=1, column=0, columnspan=2, padx=(0, 8), pady=(14, 0), sticky="nsew")
+        ctk.CTkLabel(check_card, text="Состояние системы", font=ctk.CTkFont(size=20, weight="bold"), text_color=(TEXT_LIGHT, TEXT_DARK)).pack(anchor="w", padx=18, pady=(18, 4))
+        status_line = "✓ Все бинды готовы к запуску" if not issues else f"⚠ Найдено проблем: {len(issues)}"
+        status_color = ("#168B4C", "#59D68E") if not issues else ("#A96309", "#FFC05F")
+        ctk.CTkLabel(check_card, text=status_line, font=ctk.CTkFont(size=15, weight="bold"), text_color=status_color).pack(anchor="w", padx=18, pady=(0, 12))
+
+        listbox = ctk.CTkScrollableFrame(check_card, corner_radius=12, fg_color=("#F4F6FA", "#111721"))
+        listbox.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        if not issues:
+            ctk.CTkLabel(listbox, text="Отлично. Пути, URL, задержки и структура базы выглядят нормально.", text_color=(MUTED_LIGHT, MUTED_DARK)).pack(anchor="w", padx=12, pady=18)
+        else:
+            for item in issues[:30]:
+                icon = "✕" if item["level"] == "error" else "⚠"
+                color = DANGER if item["level"] == "error" else WARNING
+                row = ctk.CTkFrame(listbox, fg_color="transparent")
+                row.pack(fill="x", padx=10, pady=4)
+                ctk.CTkLabel(row, text=icon, text_color=color, width=24).pack(side="left")
+                ctk.CTkLabel(row, text=f"{item['bind']}: {item['message']}", anchor="w", justify="left", wraplength=520, text_color=(TEXT_LIGHT, TEXT_DARK)).pack(side="left", fill="x", expand=True)
+
+        action_card = ctk.CTkFrame(body, corner_radius=18, fg_color=(CARD_LIGHT, CARD_DARK), border_width=1, border_color=("#DDE2EC", "#252C3B"))
+        action_card.grid(row=1, column=2, padx=(8, 0), pady=(14, 0), sticky="nsew")
+        ctk.CTkLabel(action_card, text="Быстрые действия", font=ctk.CTkFont(size=20, weight="bold"), text_color=(TEXT_LIGHT, TEXT_DARK)).pack(anchor="w", padx=18, pady=(18, 12))
+        for text, command in [
+            ("⚡ Открыть бинды", self.show_run_view),
+            ("＋ Создать бинд", self.show_create_view),
+            ("↥ Экспортировать", self.export_binds),
+            ("↧ Импортировать", self.import_binds),
+            ("✓ Повторить проверку", self.run_validation),
+        ]:
+            ctk.CTkButton(action_card, text=text, height=42, corner_radius=12, fg_color=("#ECEFFA", "#202737"), hover_color=("#E0E4F7", "#2A3346"), text_color=(TEXT_LIGHT, TEXT_DARK), anchor="w", command=command).pack(fill="x", padx=14, pady=5)
+
+    def _stat_card(self, parent, col: int, icon: str, title: str, value: str, sub: str):
+        card = ctk.CTkFrame(parent, corner_radius=18, fg_color=(CARD_LIGHT, CARD_DARK), border_width=1, border_color=("#DDE2EC", "#252C3B"))
+        card.grid(row=0, column=col, padx=6, pady=0, sticky="nsew")
+        ctk.CTkLabel(card, text=icon, font=ctk.CTkFont(size=24), text_color=ACCENT).pack(anchor="w", padx=16, pady=(15, 4))
+        ctk.CTkLabel(card, text=title, font=ctk.CTkFont(size=12), text_color=(MUTED_LIGHT, MUTED_DARK)).pack(anchor="w", padx=16)
+        ctk.CTkLabel(card, text=value, font=ctk.CTkFont(size=27, weight="bold"), text_color=(TEXT_LIGHT, TEXT_DARK)).pack(anchor="w", padx=16, pady=(0, 1))
+        ctk.CTkLabel(card, text=sub, font=ctk.CTkFont(size=10), text_color=(MUTED_LIGHT, MUTED_DARK)).pack(anchor="w", padx=16, pady=(0, 14))
+
+    # ---------- bind list ----------
+    def show_run_view(self):
+        self.current_view = "binds"
+        self.clear_main()
+        self._hero("Мои бинды", "Запускай последовательности программ и ссылок. Перед каждым запуском HiBinds проверяет актуальность целей.")
+        toolbar = ctk.CTkFrame(self.main, fg_color="transparent")
+        toolbar.grid(row=1, column=0, padx=20, pady=(0, 10), sticky="ew")
+        toolbar.grid_columnconfigure(0, weight=1)
+        self.search_var = tk.StringVar()
+        search = ctk.CTkEntry(toolbar, height=40, corner_radius=12, textvariable=self.search_var, placeholder_text="⌕  Поиск по биндам...")
+        search.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        search.bind("<KeyRelease>", lambda _e: self.refresh_bind_list())
+        ctk.CTkButton(toolbar, text="↻  Обновить", width=120, height=40, corner_radius=12, command=self.refresh_bind_list).grid(row=0, column=1)
+
+        self.bind_scroll = ctk.CTkScrollableFrame(self.main, corner_radius=14, fg_color=("#F5F7FB", "#121722"))
+        self.bind_scroll.grid(row=2, column=0, padx=20, pady=(0, 14), sticky="nsew")
+        self.main.grid_rowconfigure(2, weight=1)
+        self.refresh_bind_list()
+
+        bottom = ctk.CTkFrame(self.main, fg_color="transparent")
+        bottom.grid(row=3, column=0, padx=20, pady=(0, 18), sticky="ew")
+        bottom.grid_columnconfigure(0, weight=1)
+        self.console = ctk.CTkTextbox(bottom, height=92, corner_radius=14)
+        self.console.grid(row=0, column=0, padx=(0, 8), sticky="ew")
+        self.console.configure(state="disabled")
+        self.stop_button = ctk.CTkButton(bottom, text="■  Остановить", width=145, height=42, corner_radius=12, fg_color=DANGER, hover_color="#D84758", command=self.stop_running)
+        self.stop_button.grid(row=0, column=1, sticky="s")
+
+    def refresh_bind_list(self):
+        self.binds = load_binds()
+        self.validation = validate_binds(self.binds)
+        if not hasattr(self, "bind_scroll") or not self.bind_scroll.winfo_exists():
+            return
+        for child in self.bind_scroll.winfo_children():
+            child.destroy()
+        query = self.search_var.get().strip().lower() if hasattr(self, "search_var") else ""
+        rows = [(name, info) for name, info in self.binds.items() if not query or query in name.lower()]
+        if not rows:
+            ctk.CTkLabel(self.bind_scroll, text="Ничего не найдено.\nСоздай первый бинд слева →", justify="center", text_color=(MUTED_LIGHT, MUTED_DARK)).grid(row=0, column=0, pady=70)
+            return
+        for index, (name, info) in enumerate(rows):
+            actions = info.get("actions", []) if isinstance(info, dict) else []
+            hotkey = str(info.get("hotkey", "")) if isinstance(info, dict) else ""
+            card = ctk.CTkFrame(self.bind_scroll, corner_radius=16, fg_color=(CARD_LIGHT, CARD_DARK), border_width=1, border_color=("#DDE2EC", "#252C3B"))
+            card.grid(row=index, column=0, padx=4, pady=5, sticky="ew")
+            card.grid_columnconfigure(1, weight=1)
+
+            badge = ctk.CTkLabel(card, text="✓", width=34, height=34, corner_radius=17, fg_color=("#E4F7ED", "#163224"), text_color=("#168B4C", "#59D68E"), font=ctk.CTkFont(size=16, weight="bold"))
+            badge.grid(row=0, column=0, rowspan=2, padx=(12, 10), pady=12)
+            ctk.CTkLabel(card, text=name, font=ctk.CTkFont(size=16, weight="bold"), anchor="w", text_color=(TEXT_LIGHT, TEXT_DARK)).grid(row=0, column=1, padx=4, pady=(11, 1), sticky="w")
+            meta = f"{len(actions)} действий"
+            if hotkey:
+                meta += f"   •   {hotkey}"
+            ctk.CTkLabel(card, text=meta, font=ctk.CTkFont(size=11), text_color=(MUTED_LIGHT, MUTED_DARK), anchor="w").grid(row=1, column=1, padx=4, pady=(0, 11), sticky="w")
+            ctk.CTkButton(card, text="▶", width=44, height=36, corner_radius=12, command=lambda n=name: self.start_bind(n)).grid(row=0, column=2, rowspan=2, padx=4)
+            ctk.CTkButton(card, text="Удалить", width=86, height=36, corner_radius=12, fg_color="transparent", border_width=1, border_color=("#D6D9E2", "#384153"), text_color=(TEXT_LIGHT, TEXT_DARK), hover_color=("#F6E5E7", "#362027"), command=lambda n=name: self.delete_bind(n)).grid(row=0, column=3, rowspan=2, padx=(4, 12))
+
+    # ---------- create ----------
+    def show_create_view(self):
+        self.current_view = "create"
+        self.clear_main()
+        self._hero("Создать новый бинд", "Собери несколько действий в одну последовательность. Пути проверяются сразу, поэтому битые бинды не попадут в базу.")
+        wrap = ctk.CTkFrame(self.main, corner_radius=18, fg_color=(CARD_LIGHT, CARD_DARK), border_width=1, border_color=("#DDE2EC", "#252C3B"))
+        wrap.grid(row=1, column=0, padx=20, pady=(0, 18), sticky="nsew")
+        wrap.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(wrap, text="Название", font=ctk.CTkFont(size=13, weight="bold")).grid(row=0, column=0, padx=18, pady=(20, 6), sticky="w")
+        self.name_entry = ctk.CTkEntry(wrap, height=40, corner_radius=12, placeholder_text="Например: Открыть рабочие программы")
+        self.name_entry.grid(row=0, column=1, columnspan=2, padx=18, pady=(20, 6), sticky="ew")
+
+        ctk.CTkLabel(wrap, text="Горячая клавиша", font=ctk.CTkFont(size=13, weight="bold")).grid(row=1, column=0, padx=18, pady=6, sticky="w")
+        self.hotkey_entry = ctk.CTkEntry(wrap, height=40, corner_radius=12, placeholder_text="Например: Ctrl+Shift+B")
+        self.hotkey_entry.grid(row=1, column=1, padx=18, pady=6, sticky="ew")
+        ctk.CTkLabel(wrap, text="Проверяется при запуске", font=ctk.CTkFont(size=11), text_color=(MUTED_LIGHT, MUTED_DARK)).grid(row=1, column=2, padx=18, pady=6, sticky="w")
+
+        ctk.CTkLabel(wrap, text="Действие", font=ctk.CTkFont(size=13, weight="bold")).grid(row=2, column=0, padx=18, pady=6, sticky="w")
+        self.target_entry = ctk.CTkEntry(wrap, height=40, corner_radius=12, placeholder_text="C:\\Program Files\\app.exe или https://example.com")
+        self.target_entry.grid(row=2, column=1, padx=18, pady=6, sticky="ew")
+        ctk.CTkButton(wrap, text="Выбрать файл", width=120, height=40, corner_radius=12, command=self.pick_file).grid(row=2, column=2, padx=(0, 18), pady=6)
+
+        ctk.CTkLabel(wrap, text="Задержка, мс", font=ctk.CTkFont(size=13, weight="bold")).grid(row=3, column=0, padx=18, pady=6, sticky="w")
+        self.delay_entry = ctk.CTkEntry(wrap, width=160, height=40, corner_radius=12)
+        self.delay_entry.insert(0, "500")
+        self.delay_entry.grid(row=3, column=1, padx=18, pady=6, sticky="w")
+        ctk.CTkButton(wrap, text="＋ Добавить шаг", width=145, height=40, corner_radius=12, command=self.add_action).grid(row=3, column=2, padx=(0, 18), pady=6)
+
+        ctk.CTkLabel(wrap, text="Шаги", font=ctk.CTkFont(size=13, weight="bold")).grid(row=4, column=0, padx=18, pady=(16, 6), sticky="nw")
+        self.actions_box = ctk.CTkTextbox(wrap, height=180, corner_radius=12)
+        self.actions_box.grid(row=4, column=1, columnspan=2, padx=18, pady=(16, 6), sticky="ew")
+        self.actions_box.configure(state="disabled")
+
+        actions = ctk.CTkFrame(wrap, fg_color="transparent")
+        actions.grid(row=5, column=1, columnspan=2, padx=18, pady=(0, 20), sticky="e")
+        ctk.CTkButton(actions, text="Очистить", width=110, height=40, corner_radius=12, fg_color="transparent", border_width=1, command=self.clear_actions).pack(side="left", padx=4)
+        ctk.CTkButton(actions, text="Сохранить бинд", width=145, height=40, corner_radius=12, command=self.save_bind).pack(side="left", padx=4)
+
+        self.new_actions = []
+        self._render_actions()
+
+    # ---------- settings ----------
+    def show_settings(self):
+        self.current_view = "settings"
+        self.clear_main()
+        self._hero("Настройки", "Персонализируй HiBinds и включи запуск вместе с Windows. Настройки применяются сразу.")
+        card = ctk.CTkFrame(self.main, corner_radius=18, fg_color=(CARD_LIGHT, CARD_DARK), border_width=1, border_color=("#DDE2EC", "#252C3B"))
+        card.grid(row=1, column=0, padx=20, pady=(0, 18), sticky="nsew")
+        ctk.CTkLabel(card, text="Поведение приложения", font=ctk.CTkFont(size=20, weight="bold")).pack(anchor="w", padx=20, pady=(20, 8))
+
+        auto_row = ctk.CTkFrame(card, corner_radius=14, fg_color=("#F5F7FB", "#121722"))
+        auto_row.pack(fill="x", padx=18, pady=8)
+        text = ctk.CTkFrame(auto_row, fg_color="transparent")
+        text.pack(side="left", fill="x", expand=True, padx=14, pady=12)
+        ctk.CTkLabel(text, text="Запускать HiBinds вместе с Windows", font=ctk.CTkFont(size=15, weight="bold"), anchor="w").pack(anchor="w")
+        ctk.CTkLabel(text, text="Приложение будет запускаться автоматически при входе в систему.", font=ctk.CTkFont(size=11), text_color=(MUTED_LIGHT, MUTED_DARK), anchor="w").pack(anchor="w", pady=(2, 0))
+        self.autostart_var = tk.BooleanVar(value=bool(self.settings.get("autostart", False)))
+        self.autostart_switch = ctk.CTkSwitch(auto_row, text="", variable=self.autostart_var, command=self.toggle_autostart, progress_color=ACCENT, button_color="#FFFFFF", button_hover_color="#FFFFFF")
+        self.autostart_switch.pack(side="right", padx=16)
+
+        theme_row = ctk.CTkFrame(card, corner_radius=14, fg_color=("#F5F7FB", "#121722"))
+        theme_row.pack(fill="x", padx=18, pady=8)
+        text2 = ctk.CTkFrame(theme_row, fg_color="transparent")
+        text2.pack(side="left", fill="x", expand=True, padx=14, pady=12)
+        ctk.CTkLabel(text2, text="Тема интерфейса", font=ctk.CTkFont(size=15, weight="bold"), anchor="w").pack(anchor="w")
+        ctk.CTkLabel(text2, text="Тёмная, светлая или системная.", font=ctk.CTkFont(size=11), text_color=(MUTED_LIGHT, MUTED_DARK)).pack(anchor="w")
+        self.theme_menu = ctk.CTkOptionMenu(theme_row, values=["Dark", "Light", "System"], command=self.change_appearance, width=150, height=36, corner_radius=10)
+        self.theme_menu.set(self.settings.get("appearance", "Dark"))
+        self.theme_menu.pack(side="right", padx=16)
+
+        ctk.CTkLabel(card, text=f"Файл базы: {DB_FILE}", wraplength=680, justify="left", text_color=(MUTED_LIGHT, MUTED_DARK), font=ctk.CTkFont(size=11)).pack(anchor="w", padx=20, pady=(22, 4))
+        ctk.CTkLabel(card, text=f"Файл настроек: {SETTINGS_FILE}", wraplength=680, justify="left", text_color=(MUTED_LIGHT, MUTED_DARK), font=ctk.CTkFont(size=11)).pack(anchor="w", padx=20, pady=(0, 20))
+
+    # ---------- actions ----------
+    def pick_file(self):
+        path = filedialog.askopenfilename(title="Выбери программу или файл", filetypes=[("Исполняемые файлы", "*.exe"), ("Все файлы", "*.*")])
+        if path:
+            self.target_entry.delete(0, "end")
+            self.target_entry.insert(0, path)
+
+    def add_action(self):
+        target = normalize_target(self.target_entry.get())
+        if not target:
+            messagebox.showwarning("Нет действия", "Укажи путь к файлу или URL.")
+            return
+        action_type = "url" if is_url(target) else "app"
+        try:
+            delay = int(self.delay_entry.get().strip() or "0")
+            if delay < 0 or delay > 86_400_000:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("Некорректная задержка", "Укажи целое число от 0 до 86400000 мс.")
+            return
+        if action_type == "app" and not os.path.isfile(target):
+            messagebox.showwarning("Файл не найден", "Проверь путь к программе.")
+            return
+        self.new_actions.append({"type": action_type, "action": target, "delay_ms": delay})
+        self._render_actions()
+        self.target_entry.delete(0, "end")
+
+    def _render_actions(self):
+        if not hasattr(self, "actions_box") or not self.actions_box.winfo_exists():
+            return
+        self.actions_box.configure(state="normal")
+        self.actions_box.delete("1.0", "end")
+        for i, action in enumerate(self.new_actions, 1):
+            kind = "URL" if action["type"] == "url" else "APP"
+            self.actions_box.insert("end", f"{i}. [{kind}] {action['action']}   •   {action['delay_ms']} мс\n")
+        self.actions_box.configure(state="disabled")
+
+    def clear_actions(self):
+        self.new_actions.clear()
+        self._render_actions()
+
+    def save_bind(self):
+        name = self.name_entry.get().strip()
+        hotkey = self.hotkey_entry.get().strip()
+        if not name:
+            messagebox.showwarning("Нет названия", "Введи название бинда.")
+            return
+        if hotkey and not valid_hotkey(hotkey):
+            messagebox.showwarning("Некорректная клавиша", "Пример формата: Ctrl+Shift+B, F6 или Alt+Enter.")
+            return
+        if not self.new_actions:
+            messagebox.showwarning("Нет действий", "Добавь хотя бы одно действие.")
+            return
+        replacing = name in self.binds
+        if replacing and not messagebox.askyesno("Бинд существует", f"Заменить существующий бинд «{name}»?"):
+            return
+        self.binds[name] = {"hotkey": hotkey, "actions": list(self.new_actions)}
+        try:
+            save_binds(self.binds)
+        except OSError as exc:
+            messagebox.showerror("Ошибка сохранения", str(exc))
+            return
+        self.log(f"Сохранён бинд: {name}")
+        self.new_actions.clear()
+        self.name_entry.delete(0, "end")
+        self.hotkey_entry.delete(0, "end")
+        self.show_run_view()
+
+    def delete_bind(self, name: str):
+        if not messagebox.askyesno("Удаление", f"Удалить бинд «{name}»?"):
+            return
+        self.binds.pop(name, None)
+        try:
+            save_binds(self.binds)
+        except OSError as exc:
+            messagebox.showerror("Ошибка сохранения", str(exc))
+            return
+        self.log(f"Удалён бинд: {name}")
+        self.refresh_bind_list()
+
+    # ---------- import / export ----------
+    def export_binds(self):
+        if not self.binds:
+            messagebox.showinfo("Экспорт", "В базе пока нет биндов.")
+            return
+        path = filedialog.asksaveasfilename(title="Экспорт биндов", defaultextension=".hibinds", filetypes=[("HiBinds package", "*.hibinds")], initialfile="HiBinds_backup.hibinds")
+        if not path:
+            return
+        payload = {"format": "hibinds", "version": EXPORT_VERSION, "app": APP_NAME, "exported_at": datetime.now().isoformat(timespec="seconds"), "binds": self.binds}
+        try:
+            Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.log(f"Экспорт: {path}")
+            messagebox.showinfo("Экспорт готов", f"Файл сохранён:\n{path}")
+        except OSError as exc:
+            messagebox.showerror("Ошибка экспорта", str(exc))
+
+    def import_binds(self):
+        path = filedialog.askopenfilename(title="Импорт биндов", filetypes=[("HiBinds package", "*.hibinds"), ("JSON", "*.json"), ("Все файлы", "*.*")])
+        if not path:
+            return
+        try:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            imported = payload.get("binds") if isinstance(payload, dict) and payload.get("format") == "hibinds" else payload
+            if not isinstance(imported, dict):
+                raise ValueError("Файл не содержит корректной базы биндов.")
+            _, issues = validate_binds(imported)
+            if issues and not messagebox.askyesno("Есть предупреждения", f"После импорта найдено проблем: {len(issues)}.\n\nИмпортировать всё равно?"):
+                return
+            if self.binds and not messagebox.askyesno("Импорт", "Заменить текущие бинды импортированными?"):
+                return
+            self.binds = imported
+            save_binds(self.binds)
+            self.run_validation(show_message=False)
+            self.log(f"Импортировано биндов: {len(imported)}")
+            self.show_dashboard()
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            messagebox.showerror("Ошибка импорта", str(exc))
+
+    # ---------- validation ----------
+    def run_validation(self, show_message: bool = True):
+        self.binds = load_binds()
+        working, issues = validate_binds(self.binds)
+        self.validation = (working, issues)
+        if hasattr(self, "sidebar_status"):
+            if issues:
+                self.sidebar_status.configure(text=f"⚠  Требуют внимания: {len(issues)}", text_color=("#A96309", "#FFC05F"))
+            else:
+                self.sidebar_status.configure(text="●  Система готова", text_color=("#168B4C", "#59D68E"))
+        if show_message:
+            if issues:
+                preview = "\n".join(f"• {i['bind']}: {i['message']}" for i in issues[:8])
+                extra = f"\n… и ещё {len(issues)-8}" if len(issues) > 8 else ""
+                messagebox.showwarning("Проверка завершена", f"Работают: {working}\nПроблем: {len(issues)}\n\n{preview}{extra}")
+            else:
+                messagebox.showinfo("Проверка завершена", f"✓ Всё в порядке\n\nРабочих биндов: {working}")
+        if self.current_view == "dashboard":
+            self.show_dashboard()
+        elif self.current_view == "binds":
+            self.refresh_bind_list()
+
+    # ---------- runner ----------
+    def start_bind(self, name: str):
+        if self.running:
+            messagebox.showinfo("HiBinds занят", "Дождись завершения текущего бинда или нажми «Остановить».")
+            return
+        if name not in self.binds:
+            messagebox.showerror("Ошибка", "Бинд больше не существует.")
+            self.refresh_bind_list()
+            return
+        self.running = True
+        self.stop_event.clear()
+        self.sidebar_status.configure(text=f"●  Выполняется: {name}", text_color=("#A96309", "#FFC05F"))
+        threading.Thread(target=self._run_bind_worker, args=(name,), daemon=True).start()
+
+    def stop_running(self):
+        if self.running:
+            self.stop_event.set()
+            self.log("Запрос остановки отправлен…")
+
+    def _run_bind_worker(self, name: str):
+        try:
+            info = self.binds.get(name, {})
+            actions = info.get("actions", [])
+            self.log(f"▶ Запуск: {name}")
+            for index, action in enumerate(actions, 1):
+                if self.stop_event.is_set():
+                    self.log("■ Выполнение остановлено пользователем.")
+                    break
+                try:
+                    delay_ms = int(action.get("delay_ms", 0))
+                except (TypeError, ValueError):
+                    delay_ms = 0
+                self.log(f"Шаг {index}/{len(actions)}: ожидание {delay_ms} мс")
+                remaining = max(0, delay_ms) / 1000
+                while remaining > 0 and not self.stop_event.is_set():
+                    pause = min(0.1, remaining)
+                    time.sleep(pause)
+                    remaining -= pause
+                if self.stop_event.is_set():
+                    self.log("■ Выполнение остановлено.")
+                    break
+
+                target = normalize_target(str(action.get("action", "")))
+                action_type = action.get("type")
+                if action_type == "url":
+                    if not is_url(target):
+                        self.log(f"⚠ Пропущено: некорректный URL")
+                        continue
+                    webbrowser.open(target, new=2)
+                    self.log(f"🌐 Открыто: {target}")
+                elif action_type == "app":
+                    if not os.path.isfile(target):
+                        self.log(f"⚠ Пропущено: файл не найден — {target}")
+                        continue
+                    try:
+                        subprocess.Popen([target], cwd=os.path.dirname(target) or None)
+                        self.log(f"▶ Запущено: {target}")
+                    except OSError as exc:
+                        self.log(f"✕ Не удалось запустить: {exc}")
+                else:
+                    self.log(f"⚠ Неизвестный тип действия: {action_type!r}")
+            else:
+                self.log(f"✓ Бинд завершён: {name}")
+        except Exception as exc:
+            self.log(f"✕ Ошибка выполнения: {exc}")
+        finally:
+            self.after(0, self._worker_finished)
+
+    def _worker_finished(self):
+        self.running = False
+        self.run_validation(show_message=False)
+
+    def log(self, message: str):
+        self.log_queue.put(f"[{time.strftime('%H:%M:%S')}] {message}")
+
+    def _drain_logs(self):
+        try:
+            while True:
+                msg = self.log_queue.get_nowait()
+                if hasattr(self, "console") and self.console.winfo_exists():
+                    self.console.configure(state="normal")
+                    self.console.insert("end", msg + "\n")
+                    self.console.see("end")
+                    self.console.configure(state="disabled")
+        except queue.Empty:
+            pass
+        self.after(100, self._drain_logs)
+
+    # ---------- settings / shutdown ----------
+    def toggle_autostart(self):
+        enabled = bool(self.autostart_var.get())
+        ok, error = set_windows_autostart(enabled)
+        if not ok:
+            self.autostart_var.set(False)
+            self.settings["autostart"] = False
+            save_settings(self.settings)
+            messagebox.showerror("Автозапуск", error)
+            return
+        self.settings["autostart"] = enabled
+        save_settings(self.settings)
+        self.log("Автозапуск Windows включён." if enabled else "Автозапуск Windows выключен.")
+
+    def change_appearance(self, value: str):
+        ctk.set_appearance_mode(value)
+        self.settings["appearance"] = value
+        save_settings(self.settings)
+        self.configure(fg_color=(BG_LIGHT, BG_DARK))
+
+    def _on_close(self):
+        self.stop_event.set()
+        self.destroy()
+
+
+if __name__ == "__main__":
+    ensure_db()
+    app = HiBindsApp()
+    app.mainloop()
